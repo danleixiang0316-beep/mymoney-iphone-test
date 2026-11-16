@@ -49,10 +49,24 @@ const Phone=(()=>{
   const group=crypto.randomUUID();
   for(const file of files){
    try{
-    if(file.size>1000000)throw Error('文件超过 1 MB');
-    const text=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(await file.arrayBuffer());
-    const {type,mapping}=identify(text,sha256(text));
-    const event={id:crypto.randomUUID(),time:new Date().toISOString(),kind:'import',group,body:{filename:file.name,text,type,mapping,virtual:true}};
+    const zipped=/\.zip$/i.test(file.name);
+    if(!zipped&&!/\.csv$/i.test(file.name))throw Error('请选择微信账单 ZIP 或 CSV 文件');
+    if(file.size>(zipped?1100000:1000000))throw Error('文件超过大小限制');
+    let bytes=new Uint8Array(await file.arrayBuffer()),filename=file.name;
+    if(zipped){const item=await PhoneRules.zip.unpack(bytes);bytes=item.bytes;filename=item.filename;}
+    const {text,encoding}=PhoneRules.personal.decode(bytes);
+    let body;
+    if(PhoneRules.personal.headerOffset(text)){
+     let binary='';
+     for(let i=0;i<bytes.length;i+=8192)binary+=String.fromCharCode(...bytes.subarray(i,i+8192));
+     body={filename,...(zipped?{archiveName:file.name}:{}),type:'wechat',format:'wechat-personal-v1',raw:btoa(binary)};
+    }else{
+     if(zipped)throw Error('ZIP 中没有可识别的微信个人账单表头');
+     if(encoding!=='utf-8')throw Error('编码或微信个人明细表头无法确认');
+     const {type,mapping}=identify(text,sha256(text));
+     body={filename:file.name,text,type,mapping,virtual:true};
+    }
+    const event={id:crypto.randomUUID(),time:new Date().toISOString(),kind:'import',group,body};
     const p=core.apply(book,event);
     if(p.errors.length)throw Error(p.errors.map(x=>'第 '+x.line+' 行：'+x.message).join('；'));
     if(!event.skip)next.push(event);added+=p.added;updates+=p.updates;duplicates+=p.duplicates;
@@ -112,3 +126,5 @@ const Phone=(()=>{
  }
  return {read,meta,commit,api,filesPreview,backup,noteBackup,restorePreview};
 })();
+
+

@@ -1,7 +1,127 @@
 'use strict';
 const PhoneRules=(()=>{const factories={};const cache={};
+factories["src/wechat-zip"]=function(module,load){
+'use strict';
+// Read one CSV into memory. Never extract paths to the filesystem.
+async function unpack(bytes){
+ const fail=message=>{throw Error(message);};
+ if(bytes.length>1100000||bytes.length<22)fail('ZIP 大小超限或文件不完整');
+ const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+ const u16=i=>view.getUint16(i,true),u32=i=>view.getUint32(i,true);
+ let end=bytes.length-22;
+ const first=Math.max(0,end-65535);
+ while(end>=first && !(u32(end)===0x06054b50 && end+22+u16(end+20)===bytes.length))end--;
+ if(end<first)fail('ZIP 结尾无效或文件不完整');
+ if(u16(end+4)||u16(end+6)||u16(end+8)!==1||u16(end+10)!==1)fail('只支持单卷且仅含一个 CSV 文件的 ZIP；多文件或重复条目不会导入');
+ const central=u32(end+16);
+ if(central+46>end||central+u32(end+12)!==end||u32(central)!==0x02014b50)fail('ZIP 目录损坏');
+ const flags=u16(central+8),method=u16(central+10);
+ if(flags&0x41||method===99)fail('暂不支持密码保护 ZIP。请在本机解压，再选择 CSV');
+ if(flags&~0x0806 || ![0,8].includes(method))fail('不支持这种 ZIP 压缩方式或流式目录格式');
+ const size=u32(central+24),packed=u32(central+20),crc=u32(central+16);
+ if(!size||size>1000000||!packed||size>packed*200)fail('ZIP 展开体积或压缩比例超过限制');
+ const namesize=u16(central+28);
+ if(!namesize||namesize>500||central+46+namesize+u16(central+30)+u16(central+32)!==end||u16(central+34)||u32(central+42)!==0)fail('不支持分卷、隐藏条目或异常目录');
+ const filetype=(u32(central+38)>>>16)&0xf000;
+ if(filetype && filetype!==0x8000)fail('ZIP 内只接受普通文件');
+ const encoded=bytes.subarray(central+46,central+46+namesize);
+ let filename;
+ try{filename=new TextDecoder('utf-8',{fatal:true}).decode(encoded);}
+ catch{if(flags&0x800)fail('ZIP 文件名编码异常');try{filename=new TextDecoder('gb18030',{fatal:true}).decode(encoded);}catch{fail('ZIP 文件名编码异常');}}
+ if(filename.length>200||filename.split('/').some(s=>!s||s==='.'||s==='..')||/[\\:\x00-\x1f\x7f]/.test(filename))fail('ZIP 文件路径不安全');
+ if(!/\.csv$/i.test(filename))fail('ZIP 内须为微信个人账单 CSV；暂不支持工作簿或嵌套压缩包');
+ if(central<30||u32(0)!==0x04034b50||u16(6)!==flags||u16(8)!==method||u32(14)!==crc||u32(18)!==packed||u32(22)!==size||u16(26)!==namesize)fail('ZIP 文件头与目录不符');
+ const start=30+namesize+u16(28);
+ if(start+packed!==central||!encoded.every((b,i)=>bytes[30+i]===b))fail('ZIP 文件边界或名称不一致');
+ const payload=bytes.subarray(start,central);
+ let output;
+ if(method===0){if(size!==packed)fail('ZIP 长度错误');output=payload;}
+ else{
+  let decoder;
+  try{decoder=new DecompressionStream('deflate-raw');}catch{fail('此浏览器不支持离线 Deflate 解压，请在本机解压后选择 CSV');}
+  const reader=new Blob([payload]).stream().pipeThrough(decoder).getReader();
+  output=new Uint8Array(size);
+  let written=0;
+  try{
+   for(;;){const {value,done}=await reader.read();if(done)break;
+    if(written+value.length>size){await reader.cancel();fail('ZIP 展开长度超限');}
+    output.set(value,written);written+=value.length;
+   }
+  }catch{fail('ZIP 压缩数据损坏或展开长度超限');}
+  if(written!==size)fail('ZIP 展开长度错误');
+ }
+ let check=0xffffffff;
+ for(const b of output){check^=b;for(let i=0;i<8;i++)check=(check>>>1)^((check&1)?0xedb88320:0);}
+ if(((check^0xffffffff)>>>0)!==crc)fail('ZIP 完整性校验失败');
+ return {bytes:output,filename};
+}
+module.exports={unpack};
+
+};
+factories["src/wechat-personal"]=function(module,load){
+'use strict';
+const csv=load("public/csv");
+const required=['交易时间','交易类型','交易对方','商品','收/支','金额(元)','支付方式','当前状态','交易单号','商户单号'];
+function decode(bytes){
+ if(bytes[0]===80&&bytes[1]===75||bytes[0]===208&&bytes[1]===207)throw Error('压缩包或 Excel 工作簿不能直接导入，请提供保留编号文本的 CSV');
+ for(const encoding of ['utf-8','gb18030']){
+  try{
+   const text=new TextDecoder(encoding,{fatal:true,ignoreBOM:true}).decode(bytes);
+   if(/[\u0000\uFFFD]/.test(text))break;
+   return {text,encoding};
+  }catch{if(bytes[0]===239&&bytes[1]===187&&bytes[2]===191)break;}
+ }
+ throw Error('编码异常，请检查原文件或另存为 UTF-8 CSV');
+}
+function headerOffset(text){
+ const lines=text.replace(/^\uFEFF/,'').split(/\r\n|\r|\n/);
+ // Inspect the first tabular line only; never skip transactions to find a later header.
+ const i=lines.findIndex(line=>/^(?:"?交易时间"?|"?交易单号"?),/.test(line.trim()));
+ if(i<0||!/(商户单号|金额[（(]元|收\/支)/.test(lines[i]))return null;
+ if(i && !lines.slice(0,i).some(line=>line.includes('微信支付账单明细')))throw Error('无法核实微信明细前的说明行');
+ if(lines.slice(0,i).some(line=>/^\s*"?\d{4}[-/]/.test(line)))throw Error('表头前出现交易行');
+ return {i,table:lines.slice(i).join('\n')};
+}
+function parse(text){
+ const section=headerOffset(text);
+ if(!section)throw Error('缺少微信个人明细表头');
+ const p=csv.parseCSV(section.table);
+ const headers=p.headers.map(h=>h.replace('金额（元）','金额(元)').replace(/^商户订单号$/,'商户单号'));
+ if(new Set(headers).size!==headers.length)throw Error('微信账单字段重复');
+ for(const h of required)if(!headers.includes(h))throw Error('微信个人明细缺少字段：'+h);
+ const records=[],errors=[];
+ p.rows.forEach((cells,i)=>{
+  const line=p.lineNumbers[i]+section.i;
+  try{
+   const get=k=>cells[headers.indexOf(k)].trim();
+   const id=get('交易单号'),merchantId=get('商户单号'),time=get('交易时间'),direction=get('收/支'),status=get('当前状态'),nature=get('交易类型');
+   const match=/^(\d{4}-\d\d-\d\d) ([01]\d|2[0-3]):[0-5]\d:[0-5]\d$/.exec(time);
+   if(!match||new Date(match[1]+'T00:00:00Z').toJSON()?.slice(0,10)!==match[1])throw Error('交易时间无效');
+   if(!/^[\w-]+$/.test(id)||/^[\d.]+e[+-]?\d+$/i.test(id))throw Error('交易单号缺失或已被表格软件改写');
+   const money=/^[¥￥]?(\d{1,9})(?:\.(\d{1,2}))?$/.exec(get('金额(元)'));
+   if(!money)throw Error('金额格式无效');
+   const amount=Number(money[1])*100+Number((money[2]||'').padEnd(2,'0'));
+   if(amount<=0)throw Error('金额须大于零');
+   if(!['收入','支出','其他','中性交易','/','不计收支'].includes(direction))throw Error('收支方向无效');
+   if(!status||!nature||!get('交易对方'))throw Error('交易状态、类型或交易对方缺失');
+   const refund=/退款/.test(nature)&&direction!=='支出';
+   const kind=refund?'退款':direction!=='支出'?'待识别':({'水电燃气缴费':'缴费','手机充值':'缴费','公共交通乘车':'即时消费','信用卡还款':'信用卡还款','零钱提现':'账户转账','零钱充值':'账户转账','转账':'对外转账','微信红包':'红包'})[nature]||'待识别';
+   const value={transactionId:id,date:match[1],amount,merchant:get('交易对方'),account:get('支付方式'),kind,category:'未分类',paymentRef:'',platform:'',orderNo:'',evidence:['缴费','即时消费'].includes(kind)?nature:'',ruleVersion:3,
+    paymentStatus:direction==='支出'&&['支付成功','已支付','交易成功'].includes(status)?'成功':'处理中',
+    statementTime:time,merchantBillNo:merchantId,statementDirection:direction,statementStatus:status,statementKind:nature,product:get('商品')};
+   if(refund){value.returnStatus=status==='退款成功'?'成功':'申请中';if(value.returnStatus==='成功')value.statusEvidence=status;}
+   records.push({type:'wechat',line,value});
+  }catch(e){errors.push({line,message:e.message});}
+ });
+ return {records,errors};
+}
+module.exports={decode,parse,headerOffset};
+
+
+};
 factories["src/event-book"]=function(module,load){
 'use strict';
+const personal=load("src/wechat-personal");
 const csv=load("public/csv");
 const imports=load("src/import-ledger");
 const reviews=load("src/review-engine");
@@ -17,12 +137,20 @@ const queue=b=>reviews.queue(b.records,b.decisions,b.sources);
 const operations=b=>b.decisions.map(r=>({...r,time:r.created_at,targetId:r.payload.targetId,blocked:history.conflict(b.records,b.decisions,r)})).reverse();
 
 function importFile(book,body,event){
- const {type,text,filename,mapping}=body;
- if(body.virtual!==true||typeof text!=='string'||bytes(text)>1000000||typeof filename!=='string'||filename.length>200||!filename.toLowerCase().endsWith('.csv'))fail('请选择 1 MB 以内的虚拟 CSV');
- const n=csv.normalize(text,type,mapping||csv.autoMap(type,csv.parseCSV(text).headers));
+  const {type,filename,mapping}=body;
+ const official=body.format==='wechat-personal-v1';
+ let text=body.text;
+ if(official){
+  if(type!=='wechat'||typeof body.raw!=='string'||body.raw.length>1333336)fail('原始微信文件无效');
+  const bytes=Uint8Array.from(atob(body.raw),c=>c.charCodeAt(0));
+  if(bytes.length>1000000)fail('文件超过 1 MB');
+  text=personal.decode(bytes).text;
+ }
+ if((!official&&body.virtual!==true)||typeof text!=='string'||(!official&&bytes(text)>1000000)||typeof filename!=='string'||filename.length>200||!filename.toLowerCase().endsWith('.csv'))fail('请选择 1 MB 以内的虚拟 CSV');
+ const n=official?personal.parse(text):csv.normalize(text,type,mapping||csv.autoMap(type,csv.parseCSV(text).headers));
  let added=0,updates=0,duplicates=0;
  if(!n.errors.length){
-  const digest=hash(JSON.stringify([text,mapping||null]));
+  const digest=hash(JSON.stringify(official?[body.format,body.raw]:[text,mapping||null]));
   const same=book.batches.some(b=>b.source===type&&b.digest===digest);
   if(!same)book.batches.push({id:event.id,created_at:event.time,source:type,filename,digest});
   for(const r of n.records){
@@ -61,6 +189,7 @@ function replay(events){
 }
 
 module.exports={empty,state,queue,operations,apply,replay,summarize,bytes};
+
 
 };
 factories["src/import-ledger"]=function(module,load){
@@ -214,7 +343,7 @@ module.exports={paymentGroups};
 factories["src/expense-rules"]=function(module,load){
 'use strict';
 const incoming=r=>['退款','退回款'].includes(r.kind);
-const paymentStable=r=>JSON.stringify([r.transactionId,r.date,r.amount,r.merchant,r.account,r.kind,r.category,r.paymentRef,r.platform,r.orderNo,r.recipient||'',r.ownership||'',r.originalRef||'',r.targetItemId||'',r.walletChannel||'',r.walletTransactionId||'']);
+const paymentStable=r=>JSON.stringify([r.transactionId,r.date,r.amount,r.merchant,r.account,r.kind,r.category,r.paymentRef,r.platform,r.orderNo,r.recipient||'',r.ownership||'',r.originalRef||'',r.targetItemId||'',r.walletChannel||'',r.walletTransactionId||'',r.statementDirection||'',r.merchantBillNo||'',r.statementTime||'']);
 function resolvePaymentVersions(rows){
  const conflict=rows.some(r=>paymentStable(r)!==paymentStable(rows[0]));
  const successful=rows.filter(r=>['已领取','已收款'].includes(r.completionStatus));
@@ -250,6 +379,10 @@ function applyExpenseRules(input,ledger){
    ledger.review=ledger.review.filter(r=>r.id!==p.id||!r.reason.includes('无法确定'));
    if(conflict||chosen.conflict){p.status='待审核';if(p.orderId)ledger.events=ledger.events.filter(e=>e.source!==p.orderId);review(p.id,'同一资金事件性质、身份或状态证据冲突，暂停确认支出');continue;}
    if(p.direction==='in')continue;
+   if(p.raw.statementDirection && p.raw.statementDirection!=='支出'){
+     p.direction=p.raw.statementDirection==='收入'?'in':'neutral';p.fundsPosted=false;p.status='待审核';
+     review(p.id,'微信明细标为收入或中性交易，保留原始方向，不确认支出');continue;
+   }
    if(p.raw.reviewClassification&&p.raw.ownership==='未知'){p.status='待识别';if(p.orderId)ledger.events=ledger.events.filter(e=>e.source!==p.orderId);review(p.id,'审核仍无法确认收款对象是否为本人，暂不计支出');continue;}
    if(p.status==='购物订单'){
      if(!p.fundsPosted){ledger.events=ledger.events.filter(e=>e.source!==p.orderId);review(p.id,'付款成功状态缺失或未成功，订单暂不确认支出');}
@@ -311,6 +444,7 @@ function applyExpenseRules(input,ledger){
  for(const o of ledger.orders){o.net=ledger.events.filter(e=>e.source===o.id).reduce((s,e)=>s+e.amount,0);o.confirmed=ledger.events.filter(e=>e.source===o.id&&e.amount>0).reduce((s,e)=>s+e.amount,0);if(o.platform==='美团'||o.platform==='饿了么'||o.raw.orderKind==='外卖')o.status=o.confirmed?'订单已完成':'外卖待完成';}
 }
 module.exports={resolvePaymentVersions,applyExpenseRules};
+
 
 };
 factories["src/operation-history"]=function(module,load){
@@ -661,4 +795,4 @@ const K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923
 module.exports={sha256,createHash:()=>({update:value=>({digest:()=>sha256(value)})})};
 
 };
-function load(id){if(!cache[id]){const m={exports:{}};cache[id]=m;factories[id](m,load);}return cache[id].exports;}return {core:load('src/event-book'),identify:load('src/scan-format').identify,sha256:load('phone-src/hash').sha256};})();
+function load(id){if(!cache[id]){const m={exports:{}};cache[id]=m;factories[id](m,load);}return cache[id].exports;}return {zip:load('src/wechat-zip'),personal:load('src/wechat-personal'),core:load('src/event-book'),identify:load('src/scan-format').identify,sha256:load('phone-src/hash').sha256};})();
