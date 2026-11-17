@@ -42,7 +42,7 @@ const Phone=(()=>{
   });
   waiting.delete(kind);return {notice:'已经保存到本机账本。'};
  }
- async function filesPreview(files){
+ async function filesPreview(files,askCode){
   const request=++importRequest;waiting.delete('import');
   const a=await read(),book=core.replay(a.events),before=core.state(book).ledger,next=[...a.events];
   const outcomes=[];let added=0,updates=0,duplicates=0;
@@ -53,7 +53,7 @@ const Phone=(()=>{
     if(!zipped&&!/\.csv$/i.test(file.name))throw Error('请选择微信账单 ZIP 或 CSV 文件');
     if(file.size>(zipped?1100000:1000000))throw Error('文件超过大小限制');
     let bytes=new Uint8Array(await file.arrayBuffer()),filename=file.name;
-    if(zipped){const item=await PhoneRules.zip.unpack(bytes);bytes=item.bytes;filename=item.filename;}
+    if(zipped){const item=await PhoneRules.zip.unpack(bytes,askCode && (()=>askCode(file.name)));bytes=item.bytes;filename=item.filename;}
     const {text,encoding}=PhoneRules.personal.decode(bytes);
     let body;
     if(PhoneRules.personal.headerOffset(text)){
@@ -126,5 +126,6 @@ const Phone=(()=>{
  }
  return {read,meta,commit,api,filesPreview,backup,noteBackup,restorePreview};
 })();
+
 
 

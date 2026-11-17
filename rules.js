@@ -3,7 +3,7 @@ const PhoneRules=(()=>{const factories={};const cache={};
 factories["src/wechat-zip"]=function(module,load){
 'use strict';
 // Read one CSV into memory. Never extract paths to the filesystem.
-async function unpack(bytes){
+async function unpack(bytes,askCode,library=globalThis.zip){
  const fail=message=>{throw Error(message);};
  if(bytes.length>1100000||bytes.length<22)fail('ZIP 大小超限或文件不完整');
  const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
@@ -16,8 +16,9 @@ async function unpack(bytes){
  const central=u32(end+16);
  if(central+46>end||central+u32(end+12)!==end||u32(central)!==0x02014b50)fail('ZIP 目录损坏');
  const flags=u16(central+8),method=u16(central+10);
- if(flags&0x41||method===99)fail('暂不支持密码保护 ZIP。请在本机解压，再选择 CSV');
- if(flags&~0x0806 || ![0,8].includes(method))fail('不支持这种 ZIP 压缩方式或流式目录格式');
+ const encrypted=Boolean(flags&1);
+ if(encrypted&&!askCode)fail('密码保护 ZIP 需要本次解压码');
+ if(flags&~0x0807 || ![0,8,99].includes(method)||method===99&&!encrypted)fail('不支持这种加密、压缩方式或流式目录格式');
  const size=u32(central+24),packed=u32(central+20),crc=u32(central+16);
  if(!size||size>1000000||!packed||size>packed*200)fail('ZIP 展开体积或压缩比例超过限制');
  const namesize=u16(central+28);
@@ -33,6 +34,45 @@ async function unpack(bytes){
  if(central<30||u32(0)!==0x04034b50||u16(6)!==flags||u16(8)!==method||u32(14)!==crc||u32(18)!==packed||u32(22)!==size||u16(26)!==namesize)fail('ZIP 文件头与目录不符');
  const start=30+namesize+u16(28);
  if(start+packed!==central||!encoded.every((b,i)=>bytes[30+i]===b))fail('ZIP 文件边界或名称不一致');
+ if(encrypted){
+  // Only feed the library entry metadata that agrees with our bounded local header.
+  function aesExtra(offset,length){
+   const end=offset+length;let aes=null;
+   while(offset<end){
+    if(offset+4>end)fail('ZIP 附加字段损坏');
+    const tag=u16(offset),n=u16(offset+2);offset+=4;
+    if(offset+n>end)fail('ZIP 附加字段越界');
+    if(tag===0x9901){
+     if(aes||n!==7||![1,2].includes(u16(offset))||u16(offset+2)!==0x4541||
+        ![1,2,3].includes(bytes[offset+4])||![0,8].includes(u16(offset+5)))fail('不支持的 AES ZIP 参数');
+     aes=Array.from(bytes.subarray(offset,offset+n)).join(',');
+    }else if(![0x000a,0x5455,0x7875].includes(tag))fail('加密 ZIP 含未支持的附加字段');
+    offset+=n;
+   }
+   return aes;
+  }
+  const aes=aesExtra(central+46+namesize,u16(central+30));
+  if(aes!==aesExtra(30+namesize,u16(28))||Boolean(aes)!==(method===99))fail('ZIP 加密参数不一致');
+  if(!library)fail('离线解密组件尚未就绪');
+  const reader=new library.ZipReader(new library.Uint8ArrayReader(bytes),{useWebWorkers:false});
+  try{
+   const [entry]=await reader.getEntries();
+   if(!entry?.encrypted||entry.uncompressedSize!==size||entry.compressedSize!==packed||
+      ![0,8].includes(entry.compressionMethod))fail('ZIP 条目信息异常');
+   const output=new Uint8Array(size);let count=0;
+   const sink=new WritableStream({write(chunk){
+    if(count+chunk.length>size)throw Error('展开体积超限');
+    output.set(chunk,count);count+=chunk.length;
+   }});
+   const password=await askCode();
+   if(!password)fail('已取消解密或解压码为空');
+   try{
+    await entry.getData(sink,{password,useWebWorkers:false,checkCrc32:true,checkAuthenticationCode:true});
+   }catch{fail('解压码错误、文件损坏或展开失败，未导入');}
+   if(count!==size)fail('ZIP 实际展开长度错误');
+   return {bytes:output,filename};
+  }finally{await reader.close();}
+ }
  const payload=bytes.subarray(start,central);
  let output;
  if(method===0){if(size!==packed)fail('ZIP 长度错误');output=payload;}
@@ -56,6 +96,7 @@ async function unpack(bytes){
  return {bytes:output,filename};
 }
 module.exports={unpack};
+
 
 };
 factories["src/wechat-personal"]=function(module,load){

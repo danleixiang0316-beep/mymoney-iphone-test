@@ -12,11 +12,24 @@ async function refresh(){
  $('last').textContent=last?'最近确认另存：'+new Date(last.time).toLocaleString()+(last.revision!==a.revision?'。账本有变化，请再备份。':'。'):'尚未确认保存过设备外备份。';
  $('safety').hidden=!(await Phone.meta('safety'));
 }
+function askZipCode(filename){
+ const dialog=$('zipDialog'),field=$('zipCode');
+ $('zipName').textContent=filename;
+ dialog.returnValue='cancel';field.value='';
+ return new Promise(resolve=>{
+  dialog.addEventListener('close',()=>{
+   const code=dialog.returnValue==='unlock'?field.value:'';
+   field.value='';resolve(code);
+  },{once:true});
+  dialog.showModal();field.focus();
+ });
+}
+window.addEventListener('pagehide',()=>{if($('zipDialog').open)$('zipDialog').close('cancel');$('zipCode').value='';});
 function action(id,fn){$(id).onclick=async()=>{const button=$(id);button.disabled=true;try{await fn();}catch(e){$('msg').textContent=e.message;}finally{button.disabled=false;}};}
 $('files').onchange=async()=>{
  const own=++sequence;importToken=null;$('save').hidden=true;$('preview').textContent='正在生成预览…';
- try{const p=await Phone.filesPreview([...$('files').files]);if(own!==sequence)return;
- importToken=p.token;$('save').hidden=!p.token;
+ try{const p=await Phone.filesPreview([...$('files').files],askZipCode);if(own!==sequence)return;
+ $('files').value='';importToken=p.token;$('save').hidden=!p.token;
  $('preview').textContent=[...p.outcomes.map(f=>f.name+' · '+(f.ok?'可导入':'跳过：'+f.error)),
  '新增 '+p.added+' 条，更新版本 '+p.updates+' 条，重复 '+p.duplicates+' 条，导入后全账本待审核 '+p.pending+' 笔。',
  ...p.months.map(x=>x.month+' 资金流出 '+money(x.before.outflow)+' → '+money(x.after.outflow)+'；确认支出 '+money(x.before.totalExpense)+' → '+money(x.after.totalExpense))].join('\n');
@@ -34,3 +47,5 @@ action('validate',async()=>{resetRestore();const version=restoreSelection;const 
 action('restore',async()=>{await Phone.commit('restore',restoreToken,true);resetRestore();$('password').value='';$('msg').textContent='已完成恢复。';await refresh();});
 action('safety',async()=>{link(await Phone.meta('safety'),'MyMoney-恢复前');$('saved').hidden=true;$('download').click();});
 refresh().catch(e=>$('msg').textContent='无法读取本机账本：'+e.message);
+
+
