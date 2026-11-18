@@ -3,7 +3,7 @@ const $=id=>document.getElementById(id), money=n=>'¥ '+(n/100).toFixed(2);
 const now=new Date();$('month').value=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
 let importToken,restoreToken,exportRevision,objectUrl,sequence=0;
 async function refresh(){
- const a=await Phone.read(),b=PhoneRules.core.replay(a.events),q=PhoneRules.core.queue(b),m=$('month').value;
+ const a=await Phone.read(),b=await Phone.bookFor(a),q=PhoneRules.core.queue(b),m=$('month').value;
  $('total').textContent=money(PhoneRules.core.summarize(q.ledger,m).totalExpense);
  $('counts').textContent='待审核 '+q.items.length+' 笔 · 已保存 '+b.batches.length+' 个批次';
  $('rows').textContent=[...q.ledger.events.filter(e=>e.date.startsWith(m)).map(e=>e.date+' '+e.category+' 确认 '+money(e.amount)),
@@ -45,6 +45,7 @@ function resetRestore(){restoreSelection++;restoreToken=null;$('restore').hidden
 $('password').oninput=resetRestore;$('restoreFile').onchange=resetRestore;
 action('validate',async()=>{resetRestore();const version=restoreSelection;const file=$('restoreFile').files[0];if(!file)throw Error('请先选择备份文件');const r=await Phone.restorePreview(file,$('password').value);if(version!==restoreSelection)return;restoreToken=r.token;$('restoreInfo').textContent='校验通过：'+r.records+' 条记录，'+r.batches+' 个批次，'+r.decisions+' 项审核或撤销。确认将替换当前记录、原文件及全部历史。恢复前副本使用本次输入的口令。';$('restore').hidden=false;});
 action('restore',async()=>{await Phone.commit('restore',restoreToken,true);resetRestore();$('password').value='';$('msg').textContent='已完成恢复。';await refresh();});
+action('upgradeBackup',async()=>{link(await Phone.upgradeBackup(password.value),'MyMoney-升级前');password.value='';saved.hidden=true;msg.textContent='已生成升级前副本。请另存；恢复该副本会替换当前账本。';});
 action('safety',async()=>{link(await Phone.meta('safety'),'MyMoney-恢复前');$('saved').hidden=true;$('download').click();});
 refresh().catch(e=>$('msg').textContent='无法读取本机账本：'+e.message);
 
