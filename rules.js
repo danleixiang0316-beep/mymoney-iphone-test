@@ -1,5 +1,49 @@
 'use strict';
 const PhoneRules=(()=>{const factories={};const cache={};
+factories["src/personal-format"]=function(module,load){
+'use strict';
+const csv=load("public/csv");
+const fields={
+ wechat:['交易时间','交易类型','交易对方','商品','收/支','金额(元)','支付方式','当前状态','交易单号','商户单号'],
+ alipay:['交易时间','交易分类','交易对方','对方账号','商品说明','收/支','金额','收/付款方式','交易状态','交易订单号','商家订单号']
+};
+// Only existing, exact aliases. Never map timestamps or identifiers across platforms.
+const canonical=(h,type)=>type==='wechat'?({'金额（元）':'金额(元)','商户订单号':'商户单号'}[h]||h):h;
+const vocabulary=new Set([...Object.values(fields).flat(),'金额（元）','商户订单号','备注','交易创建时间','付款时间','最近修改时间','商品名称','交易号','成功退款（元）','服务费（元）','资金状态','原交易订单号','退款成功时间']);
+function header(line){
+ let quoted=false,count=1;
+ for(let i=0;i<line.length;i++){
+  if(line[i]==='"'){if(quoted&&line[i+1]==='"')i++;else quoted=!quoted;}
+  else if(line[i]===','&&!quoted)count++;
+ }
+ try{return csv.parseCSV(Array.from({length:count},(_,i)=>'column'+i).join(',')+'\n'+line).rows[0].map(h=>h.trim());}
+ catch{return null;}
+}
+function locate(text,type){
+ const lines=text.replace(/^\uFEFF/,'').split(/\r\n|\r|\n/);
+ for(let i=0;i<Math.min(lines.length,100);i++){
+  // Parse one physical header, not transaction values, for discovery.
+  const h=header(lines[i]);if(!h)continue;
+  const names=h.map(x=>canonical(x,type));
+  const distinctive=type==='wechat'?['交易单号','商户单号','支付方式','当前状态']:['交易订单号','商家订单号','收/付款方式','对方账号'];
+  if(names.filter(x=>distinctive.includes(x)).length>=2&&names.filter(x=>fields[type].includes(x)).length>=3)return {i,table:lines.slice(i).join('\n')};
+ }
+ return null;
+}
+function diagnose(text,encoding){
+ let found=[];
+ for(const line of text.replace(/^\uFEFF/,'').split(/\r\n|\r|\n/).slice(0,100)){
+  const h=header(line);if(h&&h.filter(x=>vocabulary.has(x)).length>found.filter(x=>vocabulary.has(x)).length)found=h;
+ }
+ // Never echo arbitrary headings: a malformed header may actually contain account data.
+ const names=[...new Set(found.filter(x=>vocabulary.has(x)))];
+ return {encoding:encoding||'尚未确定',fields:names,hiddenColumns:found.filter(x=>!vocabulary.has(x)).length,
+  missing:Object.fromEntries(Object.entries(fields).map(([type,list])=>[type,list.filter(x=>!found.map(h=>canonical(h,type)).includes(x))]))};
+}
+function summary(d){return '只读格式诊断：编码 '+d.encoding+'；识别字段：'+(d.fields.join('、')||'无可信字段')+'；未知列名称已隐藏 '+d.hiddenColumns+' 列。\n微信缺少字段：'+(d.missing.wechat.join('、')||'无')+'；支付宝缺少字段：'+(d.missing.alipay.join('、')||'无')+'。诊断未包含交易内容，未保存或上传。';}
+module.exports={fields,canonical,locate,diagnose,summary};
+
+};
 factories["phone-src/backup-proof-v3"]=function(module,load){
 // Frozen rules of the published phone release, used only to verify old backup proofs.
 'use strict';
@@ -931,11 +975,13 @@ module.exports={format,parse};
 factories["src/alipay-personal"]=function(module,load){
 'use strict';
 const csv=load("public/csv");
+const format=load("src/personal-format");
 const fields=['交易时间','交易分类','交易对方','对方账号','商品说明','收/支','金额','收/付款方式','交易状态','交易订单号','商家订单号'];
 function section(text){
  const lines=text.replace(/^\uFEFF/,'').split(/\r\n|\n|\r/);
- const index=lines.findIndex(line=>line.includes(',') && /交易订单号|商家订单号/.test(line) && /收\/付款方式|对方账号/.test(line));
- if(index<0)return null;
+ const candidate=format.locate(text,'alipay');
+ if(!candidate)return null;
+ const index=candidate.i;
  const head=lines.slice(0,index);
  if(index && !head.some(s=>/支付宝.*(?:交易|明细|电子客户回单)/.test(s)))throw Error('无法核实支付宝个人账单说明行');
  if(head.some(s=>/微信|商户对账|商家对账|^(?:\s*"?\d{4}[-/]|\s*"?(?:收入|支出|不计收支)"?\s*,)/.test(s)))throw Error('疑似混合文件或商户账单，请选择支付宝个人交易账单');
@@ -950,12 +996,11 @@ function identifier(id){
  if(!/^[\w-]+$/.test(id)||/^[\d.]+e[+-]?\d+$/i.test(id))throw Error('交易编号缺失或已被改写，请使用保留完整编号的 CSV');
  return id;
 }
-function parse(text){
+function parse(text,{strict=true}={}){
  const s=section(text);
  if(!s)throw Error('缺少支付宝个人账单表头');
- const {headers,rows,lineNumbers}=csv.parseCSV(s.table,true);
+ const {headers,rows,lineNumbers}=csv.parseCSV(s.table,true,true);
  for(const field of fields)if(!headers.includes(field))throw Error('支付宝个人账单缺少字段：'+field);
- if(headers.some(h=>!fields.includes(h)&&!['备注','原交易订单号','退款成功时间'].includes(h)))throw Error('支付宝文件包含未支持的列，请核实是否为个人交易明细');
  const records=[],errors=[];
  rows.forEach((row,i)=>{
   const line=s.index+lineNumbers[i];
@@ -967,6 +1012,7 @@ function parse(text){
    const amt=/^[¥￥]?(\d{1,9})(?:\.(\d{1,2}))?$/.exec(get('金额'));
    if(!amt||Number(amt[1])+Number(amt[2]||0)===0)throw Error('金额无效');
    const amount=Number(amt[1])*100+Number((amt[2]||'').padEnd(2,'0'));
+   if(strict&&(!status||!nature||!merchant))throw Error('交易状态、类型或交易对方缺失');
    const refund=direction!=='支出'&&(/退款/.test(nature)||status==='退款成功');
    const kind=refund?'退款':({'信用还款':'信用卡还款','信用卡还款':'信用卡还款','余额宝转入':'账户转账','余额宝转出':'账户转账','转账':'对外转账','红包':'红包','水电煤缴费':'缴费','公共交通乘车':'即时消费'})[nature]||'待识别';
    const posted=['交易成功','支付成功'].includes(status);
@@ -1091,6 +1137,7 @@ module.exports={unpack};
 factories["src/wechat-personal"]=function(module,load){
 'use strict';
 const csv=load("public/csv");
+const format=load("src/personal-format");
 const required=['交易时间','交易类型','交易对方','商品','收/支','金额(元)','支付方式','当前状态','交易单号','商户单号'];
 function decode(bytes){
  if(bytes[0]===80&&bytes[1]===75||bytes[0]===208&&bytes[1]===207)throw Error('压缩包或 Excel 工作簿不能直接导入，请提供保留编号文本的 CSV');
@@ -1106,8 +1153,9 @@ function decode(bytes){
 function headerOffset(text){
  const lines=text.replace(/^\uFEFF/,'').split(/\r\n|\r|\n/);
  // Inspect the first tabular line only; never skip transactions to find a later header.
- const i=lines.findIndex(line=>/^(?:"?交易时间"?|"?交易单号"?),/.test(line.trim()));
- if(i<0||!/(商户单号|金额[（(]元|收\/支)/.test(lines[i]))return null;
+ const candidate=format.locate(text,'wechat');
+ if(!candidate)return null;
+ const i=candidate.i;
  if(i && !lines.slice(0,i).some(line=>line.includes('微信支付账单明细')))throw Error('无法核实微信明细前的说明行');
  if(lines.slice(0,i).some(line=>/^\s*"?\d{4}[-/]/.test(line)))throw Error('表头前出现交易行');
  return {i,table:lines.slice(i).join('\n')};
@@ -1115,7 +1163,7 @@ function headerOffset(text){
 function parse(text){
  const section=headerOffset(text);
  if(!section)throw Error('缺少微信个人明细表头');
- const p=csv.parseCSV(section.table);
+ const p=csv.parseCSV(section.table,false,true);
  const headers=p.headers.map(h=>h.replace('金额（元）','金额(元)').replace(/^商户订单号$/,'商户单号'));
  if(new Set(headers).size!==headers.length)throw Error('微信账单字段重复');
  for(const h of required)if(!headers.includes(h))throw Error('微信个人明细缺少字段：'+h);
@@ -1205,7 +1253,7 @@ function importFile(book,body,event){
   text=personal.decode(bytes).text;
  }
  if((!official&&body.virtual!==true)||typeof text!=='string'||(!official&&bytes(text)>1000000)||typeof filename!=='string'||filename.length>200||!filename.toLowerCase().endsWith('.csv'))fail('请选择 1 MB 以内的虚拟 CSV');
- const n=official?(type==='bank'?cmb:type==='alipay'?alipay:personal).parse(text):csv.normalize(text,type,mapping||csv.autoMap(type,csv.parseCSV(text).headers));
+ const n=official?(type==='bank'?cmb:type==='alipay'?alipay:personal).parse(text,{strict:body.formatRevision===2}):csv.normalize(text,type,mapping||csv.autoMap(type,csv.parseCSV(text).headers));
  let added=0,updates=0,duplicates=0;
  if(!n.errors.length){
   const digest=hash(JSON.stringify(official?[body.format,body.raw]:[text,mapping||null]));
@@ -1794,7 +1842,7 @@ const extraPaymentFields=[['recipient','收款对象',false,[]],['ownership','�
 fields.payments.push(...extraPaymentFields,['walletChannel','原支付渠道',false,[]],['walletTransactionId','渠道流水号',false,[]]);
 fields.orders.push(['orderKind','订单性质',false,[]]);
 function schema(type){if(!['wechat','alipay','bank','orders'].includes(type))throw Error('请选择有效的账单来源');return fields[type==='orders'?'orders':'payments'];}
-function parseCSV(text,allowTrailingColumn=false){
+function parseCSV(text,allowTrailingColumn=false,allowEmptyColumns=false){
  if(typeof text!=='string'||text.length>1000000)throw Error('CSV 文件过大，最多 1 MB 文本');
  text=text.replace(/^\uFEFF/,'');if(text.includes('\uFFFD'))throw Error('文件编码不正确，请另存为 UTF-8 CSV');
  const rows=[],lineNumbers=[];let row=[],cell='',quoted=false,closed=false,line=1,rowStart=1;
@@ -1811,6 +1859,13 @@ function parseCSV(text,allowTrailingColumn=false){
  if(quoted)throw Error('CSV 有未闭合的引号');if(cell||row.length||closed)endRow();
  if(rows.length<2)throw Error('CSV 至少需要表头和一行虚拟数据');
  const headers=rows.shift().map(h=>h.trim());lineNumbers.shift();
+ if(allowEmptyColumns){
+  rows.forEach((r,i)=>{if(r.length!==headers.length)throw Error(`第 ${lineNumbers[i]} 行列数不一致`);});
+  for(let i=headers.length-1;i>=0;i--)if(!headers[i]){
+   if(rows.some(r=>r[i].trim()))throw Error('无名称的列含有内容，不能确认字段用途');
+   headers.splice(i,1);for(const r of rows)r.splice(i,1);
+  }
+ }
  if(allowTrailingColumn && headers.at(-1)==='' && rows.every(r=>r.length===headers.length&&!r.at(-1).trim())){
   headers.pop();for(const row of rows)row.pop();
  }
@@ -1963,4 +2018,4 @@ const K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923
 module.exports={sha256,createHash:()=>({update:value=>({digest:()=>sha256(value)})})};
 
 };
-function load(id){if(!cache[id]){const m={exports:{}};cache[id]=m;factories[id](m,load);}return cache[id].exports;}return {legacy:load('phone-src/backup-proof-v3'),cmb:load('src/cmb-personal'),alipay:load('src/alipay-personal'),zip:load('src/wechat-zip'),personal:load('src/wechat-personal'),core:load('src/event-book'),identify:load('src/scan-format').identify,sha256:load('phone-src/hash').sha256};})();
+function load(id){if(!cache[id]){const m={exports:{}};cache[id]=m;factories[id](m,load);}return cache[id].exports;}return {format:load('src/personal-format'),legacy:load('phone-src/backup-proof-v3'),cmb:load('src/cmb-personal'),alipay:load('src/alipay-personal'),zip:load('src/wechat-zip'),personal:load('src/wechat-personal'),core:load('src/event-book'),identify:load('src/scan-format').identify,sha256:load('phone-src/hash').sha256};})();

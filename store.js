@@ -89,6 +89,7 @@ const Phone=(()=>{
   const outcomes=[];let added=0,updates=0,duplicates=0;
   const group=crypto.randomUUID();
   for(const file of files){
+   let diagnostic;
    try{
     const zipped=/\.zip$/i.test(file.name);
     if(!zipped&&!/\.csv$/i.test(file.name))throw Error('请选择支持的明细 CSV 或 ZIP；PDF、邮件、图片及工作簿暂不支持');
@@ -96,15 +97,17 @@ const Phone=(()=>{
     const original=new Uint8Array(await file.arrayBuffer());let bytes=original,filename=file.name;
     if(zipped){const item=await PhoneRules.zip.unpack(bytes,askCode && (()=>askCode(file.name)));bytes=item.bytes;filename=item.filename;}
     const {text,encoding}=PhoneRules.personal.decode(bytes);
+    diagnostic=PhoneRules.format.diagnose(text,encoding);
     let body;
     const wallet=PhoneRules.cmb.format(text)?'bank':PhoneRules.alipay.section(text)?'alipay':PhoneRules.personal.headerOffset(text)?'wechat':null;
     if(wallet){
-     body={filename,...(zipped?{archiveName:file.name}:{}),type:wallet,format:wallet+'-personal-v1',raw:base64(bytes)};
+     body={filename,...(zipped?{archiveName:file.name}:{}),type:wallet,format:wallet+'-personal-v1',formatRevision:2,raw:base64(bytes)};
      if(zipped&&wallet!=='wechat')body.archiveRaw=base64(original);
     }else{
      if(zipped)throw Error('ZIP 中没有可识别的微信、支付宝或招行个人明细表头');
      if(encoding!=='utf-8')throw Error('编码或个人明细表头无法确认');
-     const {type,mapping}=identify(text,sha256(text));
+     let detected;try{detected=identify(text,sha256(text));}catch{throw Error('CSV 表头不认识，不能可靠确定来源或必要字段；未导入');}
+     const {type,mapping}=detected;
      body={filename:file.name,text,type,mapping,virtual:true};
     }
     const event={id:crypto.randomUUID(),time:new Date().toISOString(),kind:'import',group,body,rulesVersion:core.RULES};
@@ -112,7 +115,7 @@ const Phone=(()=>{
     if(p.errors.length)throw Error(p.errors.map(x=>'第 '+x.line+' 行：'+x.message).join('；'));
     if(!event.skip)next.push(event);added+=p.added;updates+=p.updates;duplicates+=p.duplicates;
     outcomes.push({name:file.name,ok:true});
-   }catch(e){outcomes.push({name:file.name,ok:false,error:e.message});}
+   }catch(e){outcomes.push({name:file.name,ok:false,error:e.message,diagnostic});}
   }
   const q=core.queue(book),after=q.ledger;
   const months=[...new Set([before,after].flatMap(l=>[...l.payments,...l.events].map(x=>x.date.slice(0,7))))].sort();

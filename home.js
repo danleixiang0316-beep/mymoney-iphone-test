@@ -30,7 +30,7 @@ $('files').onchange=async()=>{
  const own=++sequence;importToken=null;$('save').hidden=true;$('preview').textContent='正在生成预览…';
  try{const p=await Phone.filesPreview([...$('files').files],askZipCode);if(own!==sequence)return;
  $('files').value='';importToken=p.token;$('save').hidden=!p.token;
- $('preview').textContent=[...p.outcomes.map(f=>f.name+' · '+(f.ok?'可导入':'跳过：'+f.error)),
+ $('preview').textContent=[...p.outcomes.map(f=>f.name+' · '+(f.ok?'可导入':'跳过：'+f.error+(f.diagnostic?'\n'+PhoneRules.format.summary(f.diagnostic):''))),
  '新增 '+p.added+' 条，更新版本 '+p.updates+' 条，重复 '+p.duplicates+' 条，导入后全账本待审核 '+p.pending+' 笔。',
  ...p.months.map(x=>x.month+' 资金流出 '+money(x.before.outflow)+' → '+money(x.after.outflow)+'；确认支出 '+money(x.before.totalExpense)+' → '+money(x.after.totalExpense))].join('\n');
  }catch(e){$('preview').textContent=e.message;}
